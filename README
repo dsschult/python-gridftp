@@ -1,4 +1,4 @@
-pygridftp
+python-gridftp
 ============
 A python wrapper for the c api of the globus library, gridftp section.
 
@@ -13,7 +13,12 @@ To install:
     python setup.py build
     sudo python setup.py install
 
-    
+
+Usage
+=====
+from gridftpClient import gridftpwrapper
+
+
 Building OS Packages
 ====================
 To build debian Wheezy packages, do
