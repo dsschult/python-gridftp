@@ -445,7 +445,10 @@ class Buffer(object):
         self._buffer = None
 
         try:
-            self._buffer = gridftpwrapper.gridftp_create_buffer(size)
+            if isinstance(size,str):
+                (self._buffer,size) = gridftpwrapper.gridftp_buffer_from_string(size)
+            else:
+                self._buffer = gridftpwrapper.gridftp_create_buffer(size)
         except Exception, e:
             msg = "Unable to create buffer: %s" % e
             ex = GridFTPClientException(msg)
@@ -877,6 +880,130 @@ class FTPClient(object):
             ex = GridFTPClientException(msg)
             raise ex
 
+    def put(self, url, completeCallback, arg, opAttr = None, marker = None):
+        """
+        Store a file on an FTP server.
+
+        This function starts a put file transfer to an FTP server. If
+        this function returns without exception then the user may immediately
+        begin calling register_write() to send the data associated with this URL.
+
+        When all of the data associated with this URL is sent, and all
+        of the data callbacks have been called, or if the put request is
+        aborted, the completeCallback will be invoked with the final
+        status of the put.
+
+        The completeCallback function must have the form:
+
+        def completeCallback(arg, handle, error):
+            - arg is the user argument passed in when the transfer was
+              initiated
+            - handle is the wrapped pointer to the client handle
+            - error is None for success or a string if an error occurred
+
+        @param url: the URL to store the data to
+        @type url: string
+
+        @param completeCallback: function to call when the transfer is
+        complete
+        @type completeCallback: callable
+
+        @param arg: user argument to pass to the callback
+        @type arg: any
+
+        @param opAttr: an instance of OperationAttr for the transfer
+        @type opAttr: instance of OperationAttr
+
+        @param marker: not currently supported, please pass in None
+        @type marker: None
+
+        @return: None
+        @rtype: None
+
+        @raise GridFTPClientException: raised if unable to initaite the put
+        operation
+
+        """
+        if not opAttr:
+            msg = "An OperationAttr instance must be input"
+            ex = GridFTPClientException(msg)
+            raise ex
+
+        try:
+            gridftpwrapper.gridftp_put(
+                self._handle, 
+                url,
+                opAttr._attr,
+                None,
+                completeCallback,
+                arg
+                )
+        except Exception, e:
+            msg = "Unable to initiate put: %s" % e
+            ex = GridFTPClientException(msg)
+            raise ex
+
+    def register_write(self, buffer, offset, eof, dataCallback, arg):
+        """
+        Register an instance of class Buffer and the function dataCallback
+        to handle a part of the FTP data transfer.
+
+        The instance of class Buffer will be associated with the current put being
+        performed on this client handle and data will be read from the
+        buffer. The user must then fill and register another buffer
+        instance for the transfer to proceed. Note that if parallel data
+        channels are used multiple buffers should be registered.
+
+        When the data is written the function dataCallback will be called.
+
+        The dataCallback function must have the form:
+
+        def dataCallback(arg, handle, error, buffer, length, offset, eof):
+            - arg is the user argument passed in when this function is called
+            - handle is the wrapped pointer to the client handle
+            - error is the error code
+            - buffer is the buffer from which the data can be read
+            - length is the number of bytes in the buffer
+            - offset is the offset into the file at which the bytes start
+            - eof is true if this is the end of the file
+
+        @param buffer: instance of class Buffer from which the data will be
+        written
+        @type buffer: instance of class Buffer
+        
+        @param offset: offset of buffer
+        @type offset: int
+        
+        @param eof: end of file
+        @type eof: bool
+
+        @param dataCallback: function to be called when the data is written
+        @type dataCallback: callable
+
+        @param arg: user argument to pass to the callback function
+        @type arg: any
+
+        @return: None
+        @rtype: None
+
+        @raises GridFTPException: raised if unable to register the buffer
+        and callback for reading
+
+        """
+        try:
+            gridftpwrapper.gridftp_register_write(
+                self._handle,
+                buffer._buffer,
+                buffer.size,
+                offset,
+                eof,
+                dataCallback,
+                arg
+                )
+        except Exception, e:
+            msg = "Unable to register write: %s" % e
+            ex = GridFTPClientException(msg)
+            raise ex
             
     def cksm(self, url, completeCallback, arg, opAttr = None, offset = None, length = None):
         """
@@ -941,6 +1068,57 @@ class FTPClient(object):
             ex = GridFTPClientException(msg)
             raise ex
 
+    def size(self, url, completeCallback, arg, opAttr = None):
+        """
+        Get a file's size from an FTP server.
+
+        This function requests the size of a file from an FTP server.
+
+        When the request is completed or aborted, the completeCallback
+        will be invoked with the final status of the operation and the
+        size value. 
+
+        The completeCallback must have the form:
+
+        def completeCallback(size, arg, handle, error):
+            - size is an integer containing the checksum value
+            - arg is the user argument passed in when the call was
+              initiated
+            - handle is the wrapper pointer to the client handle
+            - error is None for success or a string if an error occurred
+
+        @param url: the source URL for the file to be checksummed
+        @type url: string
+
+        @param completeCallback: the function to be called when the checksum
+        operation is complete
+        @type completeCallback: callable
+
+        @param arg: user argument to pass to the callback function
+        @type arg: any
+
+        @param opAttr: an instance of OperationAttr for the source
+        @type opAttr: instance of OperationAttr
+
+        @return: None
+        @rtype: None
+
+        @raise GridFTPClientException: raised if unable to initiate the
+        checksum operation
+        """
+
+        if not opAttr:
+            msg = "An OperationAttr instance must be input"
+            ex = GridFTPClientException(msg)
+            raise ex
+
+        try:
+            gridftpwrapper.gridftp_size(self._handle, url, opAttr._attr, completeCallback, arg)
+        except Exception, e:
+            msg = "Unable to get size: %s" % e
+            ex = GridFTPClientException(msg)
+            raise ex
+    
     def mkdir(self, url, completeCallback, arg, opAttr = None):
         """
         Make a directory on a server.

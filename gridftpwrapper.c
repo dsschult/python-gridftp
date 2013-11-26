@@ -106,20 +106,6 @@ static globus_module_descriptor_t   *modules[] = {
   GLOBUS_FTP_CLIENT_MODULE,
 };                        
 
-static void prepare()
-{}
-
-static void parent()
-{}
-
-static void child()
-{ 
-  sigset_t sm;
-  sigemptyset(&sm);
-  pthread_sigmask(SIG_SETMASK, &sm, NULL);
-}
-
-
 #define NMODS   (sizeof(modules) / sizeof(globus_module_descriptor_t *))
 
 //
@@ -148,6 +134,15 @@ typedef struct
     char cksm[32];         // the checksum value
 
 } cksm_callback_bucket_t;
+
+// used to store pointers to the Python objects that should
+// be used during a callback for a size operation
+typedef struct
+{
+    PyObject * pyfunction; // Python object for the Python function to call as callback
+    PyObject * pyarg;      // Python object for the Python argument to pass in to the callback
+    globus_off_t size;     // the size value
+} size_callback_bucket_t;
 
 // used to store pointers to the Python objects that should
 // be used during a callback for a mkdir operation
@@ -340,6 +335,67 @@ static void cksm_complete_callback(void * user_data, globus_ftp_client_handle_t 
 
     // prepare the arg list to pass into the Python callback function
     arglist = Py_BuildValue("(sOOO)", callbackBucket -> cksm, arg, handleObj, errorObject);
+
+    // now call the Python callback function
+    result = PyEval_CallObject(func, arglist);
+
+    if (result == NULL) {
+
+        // something went wrong so print to stderr
+        PyErr_Print();
+    }
+
+    // take care of reference handling
+    Py_DECREF(handleObj);
+    Py_DECREF(arglist);
+    Py_XDECREF(result);
+    Py_XDECREF(errorObject);
+
+    // release the Python GIL from this thread
+    PyGILState_Release(gstate);
+
+    // free the space the callback bucket was holding
+    free(callbackBucket);
+
+    return;
+}
+
+// callback for the completion of size operations
+static void size_complete_callback(void * user_data, globus_ftp_client_handle_t * handle, globus_object_t * error) 
+{
+    PyObject * func;
+    PyObject * arglist; 
+    PyObject * result; 
+    PyObject * arg;
+    PyObject * handleObj;
+    PyObject * errorObject;
+
+
+    // cast the user_data that the GridFTP libraries are passing in to the
+    // callback structure where we previously stored the Python function and
+    // arguments to call
+    size_callback_bucket_t * callbackBucket = (size_callback_bucket_t *) user_data;
+
+    // we need to obtain the Python GIL before this thread can manipulate any Python object
+    PyGILState_STATE gstate;
+    gstate = PyGILState_Ensure();
+
+    // pick off the function and argument pointers we want to pass back into Python
+    func = callbackBucket -> pyfunction;
+    arg = callbackBucket -> pyarg;
+
+    // create a handle object to pass back into Python
+    handleObj = PyCObject_FromVoidPtr((void *) handle, NULL);
+
+    // create an error object to pass back into Python
+    if (error){
+        errorObject = Py_BuildValue("s", globus_error_print_chain(error));
+    } else{
+        errorObject = Py_BuildValue("s", NULL);
+    }
+
+    // prepare the arg list to pass into the Python callback function
+    arglist = Py_BuildValue("(lOOO)", (long) callbackBucket -> size, arg, handleObj, errorObject);
 
     // now call the Python callback function
     result = PyEval_CallObject(func, arglist);
@@ -1049,13 +1105,6 @@ PyObject * gridftp_modules_activate(PyObject * self, PyObject * args)
     int           i;
     int           rc;
 
-    // this is new with Globus 5.2.x
-    Py_BEGIN_ALLOW_THREADS
-	globus_thread_set_model("pthread");
-    Py_END_ALLOW_THREADS
-	
-
-
     for (i = 0; i < NMODS; i++){
     
         Py_BEGIN_ALLOW_THREADS
@@ -1068,16 +1117,6 @@ PyObject * gridftp_modules_activate(PyObject * self, PyObject * args)
 	  PyErr_SetString(PyExc_RuntimeError, "gridftpwrapper: unable to activate Globus module");
         }
     }
-
-    // one of the globus modules changes the signal handling behavior.
-    // http://jira.globus.org/browse/GT-360
-    // The next line ensures that any forked subprocesses still catch
-    // SIGTERM, SIGHUP, SIGINT. Without this line, these signals are
-    // not passed along and forked processes will miss these messages.
-    Py_BEGIN_ALLOW_THREADS
-      pthread_atfork(&prepare, &parent, &child);
-    Py_END_ALLOW_THREADS
-
 
     Py_RETURN_NONE;
 }
@@ -1163,6 +1202,49 @@ PyObject * gridftp_destroy_buffer(PyObject * self, PyObject * args)
 
     // return None to indicate success
     Py_RETURN_NONE;
+}
+
+// add data from a Python string to a buffer
+PyObject * gridftp_buffer_from_string(PyObject * self, PyObject * args)
+{
+
+    globus_byte_t * buffer = NULL;
+    char * newdata;
+    int size;
+    unsigned long size2;
+    char msg[2048] = "";
+
+    PyObject * bufferObj;
+
+    // get Python arguments
+    if (!PyArg_ParseTuple(args, "s#", &newdata, &size)){
+        PyErr_SetString(PyExc_RuntimeError, "gridftpwrapper: unable to parse arguments");
+        return NULL;
+    }
+    size2 = (unsigned long) size;
+
+    // allocate the memory
+    Py_BEGIN_ALLOW_THREADS
+
+    buffer = globus_malloc(sizeof(globus_byte_t) * size2);
+
+    if (buffer == NULL) {
+        sprintf(msg, "gridftpwrapper: unable to create buffer");
+        PyErr_SetString(PyExc_RuntimeError, msg);
+    } else {
+        memset(buffer, 0, (size_t) size2);
+        memmove(buffer, newdata, (size_t) size2);
+    }
+    
+    Py_END_ALLOW_THREADS
+
+    // wrap pointer to buffer and return
+    if (buffer == NULL) {
+        return NULL;
+    } else {
+        bufferObj = PyCObject_FromVoidPtr((void *) buffer, NULL);
+        return Py_BuildValue("Ni",bufferObj,size);
+    }
 }
 
 // return a Python string representation of the data in a buffer
@@ -1897,6 +1979,78 @@ PyObject * gridftp_cksm(PyObject *self, PyObject *args)
 
 }
 
+// compute the size of a file
+// note that it is returned in a callback
+PyObject * gridftp_size(PyObject *self, PyObject *args)
+{
+    globus_ftp_client_handle_t * handlep = NULL;
+    char * url = NULL;
+    globus_ftp_client_operationattr_t * operation_attrp = NULL;
+    int offset = -1;
+    int length = -1;
+
+    PyObject * handleObj;
+    PyObject * OpAttrObj;
+    PyObject * completeCallbackFunctionObj;
+    PyObject * completeCallbackArgObj;
+
+    size_callback_bucket_t * callbackBucket = NULL;
+
+    globus_result_t gridftp_result;
+    char msg[2048] = ""; 
+
+    // get Python arguments
+    if (!PyArg_ParseTuple(args, "OsOOO", 
+            &handleObj, 
+            &url, 
+            &OpAttrObj,
+            &completeCallbackFunctionObj,
+            &completeCallbackArgObj
+            )){
+        PyErr_SetString(PyExc_RuntimeError, "gridftpwrapper: unable to parse arguments");
+        return NULL;
+    }
+ 
+    // get the bare pointers from the python objects
+    handlep = (globus_ftp_client_handle_t *) PyCObject_AsVoidPtr(handleObj);
+    operation_attrp = (globus_ftp_client_operationattr_t *) PyCObject_AsVoidPtr(OpAttrObj);
+
+    // create a cksm callback struct to hold the callback information
+    callbackBucket = (size_callback_bucket_t *) globus_malloc(sizeof(size_callback_bucket_t));
+    callbackBucket -> pyfunction = completeCallbackFunctionObj;
+    callbackBucket -> pyarg = completeCallbackArgObj;
+
+    // since we are holding pointers to these objects we need to increase
+    // the reference count for each
+    Py_XINCREF(callbackBucket -> pyfunction);
+    Py_XINCREF(callbackBucket -> pyarg);
+
+    // kick off the checksum operation
+
+    Py_BEGIN_ALLOW_THREADS
+
+    gridftp_result = globus_ftp_client_size(
+                        handlep,
+                        url,
+                        operation_attrp,
+                        & callbackBucket -> size,
+                        size_complete_callback,
+                        (void *) callbackBucket
+                        );
+
+    Py_END_ALLOW_THREADS
+
+    if (gridftp_result != GLOBUS_SUCCESS){
+        sprintf(msg, "gridftpwrapper: rc = %d: unable to start size operation", gridftp_result);
+        PyErr_SetString(PyExc_RuntimeError, msg);
+        return NULL;
+    }
+
+    // return None to indicate success
+    Py_RETURN_NONE;
+
+}
+
 // make a directory
 // the status is returned in a callback
 PyObject * gridftp_mkdir(PyObject *self, PyObject *args)
@@ -2321,6 +2475,80 @@ PyObject * gridftp_get(PyObject *self, PyObject *args)
 
 }
 
+
+// start a gridftp put operation
+PyObject * gridftp_put(PyObject *self, PyObject *args)
+{
+    globus_ftp_client_handle_t * handlep = NULL;
+    char * src = NULL;
+    globus_ftp_client_operationattr_t * operation_attrp = NULL;
+    // globus_ftp_client_restart_marker_t * restart_markerp = NULL;
+
+    PyObject * handleObj;
+    PyObject * opAttrObj;
+    PyObject * restartMarkerObj;
+    PyObject * completeCallbackFunctionObj;
+    PyObject * completeCallbackArgObj;
+
+    get_complete_callback_bucket_t * callbackBucket = NULL;
+
+    globus_result_t gridftp_result;
+    char msg[2048] = ""; 
+
+    // get Python arguments
+    if (!PyArg_ParseTuple(args, "OsOOOO", 
+            &handleObj, 
+            &src, 
+            &opAttrObj,
+            &restartMarkerObj,
+            &completeCallbackFunctionObj,
+            &completeCallbackArgObj
+            )){
+        PyErr_SetString(PyExc_RuntimeError, "gridftpwrapper: unable to parse arguments");
+        return NULL;
+    }
+ 
+    // get the bare pointers from the python objects
+    handlep = (globus_ftp_client_handle_t *) PyCObject_AsVoidPtr(handleObj);
+    operation_attrp = (globus_ftp_client_operationattr_t *) PyCObject_AsVoidPtr(opAttrObj);
+    //restart_markerp = (globus_ftp_client_restart_marker_t *) PyCObject_AsVoidPtr(restartMarkerObj);
+
+    // create a get callback struct to hold the callback information
+    callbackBucket = (get_complete_callback_bucket_t *) globus_malloc(sizeof(get_complete_callback_bucket_t));
+    callbackBucket -> pyfunction = completeCallbackFunctionObj;
+    callbackBucket -> pyarg = completeCallbackArgObj;
+
+    // since we are holding pointers to these objects we need to increase
+    // the reference count for each
+    Py_XINCREF(callbackBucket -> pyfunction);
+    Py_XINCREF(callbackBucket -> pyarg);
+
+    // kick off the get transfer 
+
+    Py_BEGIN_ALLOW_THREADS
+
+    gridftp_result = globus_ftp_client_put(
+                        handlep,
+                        src,
+                        operation_attrp,
+                        NULL,
+                        get_complete_callback,
+                        (void *) callbackBucket
+                        );
+
+    Py_END_ALLOW_THREADS
+
+    if (gridftp_result != GLOBUS_SUCCESS){
+        sprintf(msg, "gridftpwrapper: rc = %d: unable to start put transfer", gridftp_result);
+        PyErr_SetString(PyExc_RuntimeError, msg);
+        return NULL;
+    }
+
+    // return None to indicate success
+    Py_RETURN_NONE;
+
+}
+
 // start a gridftp verbose list operation
 PyObject * gridftp_verbose_list(PyObject *self, PyObject *args)
 {
@@ -2450,6 +2678,83 @@ PyObject * gridftp_register_read(PyObject *self, PyObject *args)
 
     if (gridftp_result != GLOBUS_SUCCESS){
         sprintf(msg, "gridftpwrapper: rc = %d: unable to register read", gridftp_result);
+        PyErr_SetString(PyExc_RuntimeError, msg);
+        return NULL;
+    }
+
+    // return None to indicate success
+    Py_RETURN_NONE;
+
+}
+
+
+// register the data callback function for a put operation
+PyObject * gridftp_register_write(PyObject *self, PyObject *args)
+{
+    globus_ftp_client_handle_t * handlep = NULL;
+    globus_byte_t * buffer = NULL;
+    unsigned long buffer_length = 0;
+    unsigned long offset = 0;
+    int eof = 0;
+
+    PyObject * handleObj;
+    PyObject * bufferObj;
+    PyObject * dataCallbackFunctionObj;
+    PyObject * dataCallbackArgObj;
+
+    get_data_callback_bucket_t * callbackBucket = NULL;
+
+    globus_result_t gridftp_result;
+    char msg[2048] = ""; 
+
+    // get Python arguments
+    if (!PyArg_ParseTuple(args, "OOkkiOO", 
+            &handleObj, 
+            &bufferObj, 
+            &buffer_length,
+            &offset,
+            &eof,
+            &dataCallbackFunctionObj,
+            &dataCallbackArgObj
+            )){
+        PyErr_SetString(PyExc_RuntimeError, "gridftpwrapper: unable to parse arguments");
+        return NULL;
+    }
+ 
+    // get the bare pointers from the python objects
+    handlep = (globus_ftp_client_handle_t *) PyCObject_AsVoidPtr(handleObj);
+    buffer = (globus_byte_t *) PyCObject_AsVoidPtr(bufferObj);
+
+    // create a data callback struct to hold the callback information
+    callbackBucket = (get_data_callback_bucket_t *) globus_malloc(sizeof(get_data_callback_bucket_t));
+    callbackBucket -> pyfunction = dataCallbackFunctionObj;
+    callbackBucket -> pyarg = dataCallbackArgObj;
+    callbackBucket -> pybuffer = bufferObj;
+
+    // since we are holding pointers to these objects we need to increase
+    // the reference count for each
+    Py_XINCREF(callbackBucket -> pyfunction);
+    Py_XINCREF(callbackBucket -> pyarg);
+    Py_XINCREF(callbackBucket -> pybuffer);
+
+    // register the read
+
+    Py_BEGIN_ALLOW_THREADS
+
+    gridftp_result = globus_ftp_client_register_write(
+                        handlep,
+                        buffer,
+                        (globus_size_t) buffer_length,
+                        (globus_off_t) offset,
+                        (globus_bool_t) eof,
+                        get_data_callback,
+                        (void *) callbackBucket
+                        );
+
+    Py_END_ALLOW_THREADS
+
+    if (gridftp_result != GLOBUS_SUCCESS){
+        sprintf(msg, "gridftpwrapper: rc = %d: unable to register write", gridftp_result);
         PyErr_SetString(PyExc_RuntimeError, msg);
         return NULL;
     }
@@ -2738,7 +3043,7 @@ PyObject * gridftp_exists(PyObject *self, PyObject *args)
     Py_BEGIN_ALLOW_THREADS
 
     gridftp_result = globus_ftp_client_exists(
-		         handlep,
+                        handlep,
                         url,
                         operation_attrp,
                         exists_complete_callback,
@@ -2794,6 +3099,7 @@ static PyMethodDef gridftpwrappermethods[] = {
     {"gridftp_tcpbuffer_set_size", gridftp_tcpbuffer_set_size, METH_VARARGS},
     {"gridftp_third_party_transfer", gridftp_third_party_transfer, METH_VARARGS},
     {"gridftp_cksm", gridftp_cksm, METH_VARARGS},
+    {"gridftp_size", gridftp_size, METH_VARARGS},
     {"gridftp_mkdir", gridftp_mkdir, METH_VARARGS},
     {"gridftp_rmdir", gridftp_rmdir, METH_VARARGS},
     {"gridftp_delete", gridftp_delete, METH_VARARGS},
@@ -2801,11 +3107,14 @@ static PyMethodDef gridftpwrappermethods[] = {
     {"gridftp_chmod", gridftp_chmod, METH_VARARGS},
     {"gridftp_exists", gridftp_exists, METH_VARARGS},
     {"gridftp_get", gridftp_get, METH_VARARGS},
+    {"gridftp_put", gridftp_put, METH_VARARGS},
     {"gridftp_verbose_list", gridftp_verbose_list, METH_VARARGS},
     {"gridftp_register_read", gridftp_register_read, METH_VARARGS},
+    {"gridftp_register_write", gridftp_register_write, METH_VARARGS},
     {"gridftp_create_buffer", gridftp_create_buffer, METH_VARARGS},
     {"gridftp_destroy_buffer", gridftp_destroy_buffer, METH_VARARGS},
     {"gridftp_buffer_to_string", gridftp_buffer_to_string, METH_VARARGS},
+    {"gridftp_buffer_from_string", gridftp_buffer_from_string, METH_VARARGS},
     {"gridftp_abort", gridftp_abort, METH_VARARGS},
     {"gridftp_perf_plugin_init", gridftp_perf_plugin_init, METH_VARARGS},
     {"gridftp_perf_plugin_destroy", gridftp_perf_plugin_destroy, METH_VARARGS},
@@ -2834,6 +3143,14 @@ void initgridftpwrapper(){
     // or engaging in any other thread operations...this is a no-op when called 
     // for a second time. 
     PyEval_InitThreads();
+    
+    Py_BEGIN_ALLOW_THREADS
+    
+    if (globus_thread_set_model("pthread") != GLOBUS_SUCCESS) {
+        PyErr_SetString(PyExc_RuntimeError, "Cannot enable threading for globus");
+    }
+    
+    Py_END_ALLOW_THREADS
 
     // initialize the necessary Globus modules
     gridftp_modules_activate(NULL, NULL);

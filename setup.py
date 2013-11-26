@@ -1,9 +1,10 @@
 import os
 import sys
 import platform
+import glob
 from distutils.core import setup, Extension
 
-version="1.3.3"
+version="1.4.0"
 GLOBUS_LOCATION = "/usr"
 
 try:
@@ -11,23 +12,23 @@ try:
 except KeyError:
     print >> sys.stderr, "GLOBUS_LOCATION is not set; using default %s" %(GLOBUS_LOCATION)
 
-if platform.dist()[0] == 'debian':
-        my_include_dirs=[ "/usr/include/globus", "/usr/lib/globus/include" ]
-else:
-        my_include_dirs=[ "/usr/include/globus", "/usr/lib64/globus/include" ]
-    
 linkFlags = [
+"-Bstatic",
 "-L%s/lib64" % GLOBUS_LOCATION,
 "-lglobus_ftp_client",
 "-lglobus_io",
 "-lglobus_common",
+"-Bdynamic"
 ]
 
-if platform.dist()[0] == 'debian':
-        my_include_dirs=[ "/usr/include/globus", "/usr/lib/globus/include" ]
-else:
-        my_include_dirs=[ "/usr/include/globus", "/usr/lib64/globus/include" ]
-    
+my_include_dirs=["%s/include/globus"%GLOBUS_LOCATION]
+for dir in glob.iglob("%s/include/globus/*"%GLOBUS_LOCATION):
+    if os.path.isdir(dir):
+        my_include_dirs.append(dir)
+if os.path.exists("/usr/lib/globus/include"):
+    my_include_dirs.append("/usr/lib/globus/include")
+elif os.path.exists("/usr/lib64/globus/include"):
+    my_include_dirs.append("/usr/lib64/globus/include")
 
 e = Extension(
         "gridftpwrapper",

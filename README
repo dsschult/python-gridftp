@@ -1,10 +1,31 @@
+pygridftp
+============
+A python wrapper for the c api of the globus library, gridftp section.
+
+
+Installation
+============
+Requires globus gridftp-client library installation, with GLOBUS_LOCATION
+set to the directory containing the installation.
+
+To install:
+
+    python setup.py build
+    sudo python setup.py install
+
+    
+Building OS Packages
+====================
 To build debian Wheezy packages, do
 
   make deb
 
-to build Centos 6.4 RPMs, do
+To build Centos 6.4 RPMs, do
 
   make rpm
 
+  
+Tests
+=====  
 Some simple tests are in the files named test_*. These are more
 akin to minimal examples than tests, but better than nothing.
